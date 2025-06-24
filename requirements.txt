@@ -3,3 +3,5 @@ requests>=2.25.1
 websocket-client>=1.0.0
 cryptography>=3.4.8
 dateparser>=1.1.0
+streamlit
+plotly
