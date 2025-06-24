@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Fixed Trading Bot for Binance Futures Testnet with Timestamp Synchronization
+Enhanced Trading Bot for Binance Futures with Requests Integration
 Author: Trading Bot Implementation
-Description: A comprehensive trading bot with timestamp sync and enhanced error handling
+Description: Enhanced trading bot with direct HTTP requests and fallback mechanisms
 """
 
 import os
@@ -11,21 +11,278 @@ import json
 import logging
 import argparse
 import time
-import requests
+import hmac
+import hashlib
+import urllib.parse
 from datetime import datetime
 from typing import Dict, Any, Optional, List
 from decimal import Decimal, ROUND_DOWN
 from dotenv import load_dotenv
-load_dotenv()  # This loads the .env file
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+load_dotenv()
+
+
+# Create logs directory if it doesn't exist
+os.makedirs("logs", exist_ok=True)
+
+# Setup logging
+log_filename = datetime.now().strftime("logs/trading_bot_%Y%m%d_%H%M%S.log")
+logging.basicConfig(
+    filename=log_filename,
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+
+logger = logging.getLogger("TradingBot")
 
 try:
     from binance.client import Client
     from binance.exceptions import BinanceAPIException, BinanceOrderException
     from binance.enums import *
 except ImportError:
-    print("Error: python-binance library not installed. Install with: pip install python-binance")
-    sys.exit(1)
+    print("Warning: python-binance library not installed. Using requests-only mode.")
+    Client = None
+    BinanceAPIException = Exception
+    BinanceOrderException = Exception
 
+class RequestsAPIClient:
+    """Direct HTTP client for Binance API using requests"""
+    
+    def __init__(self, api_key: str, api_secret: str, testnet: bool = True, timeout: int = 10):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.timeout = timeout
+        self.time_offset = 0  # Add time offset tracking
+        
+        # Set base URLs
+        if testnet:
+            self.base_url = "https://testnet.binancefuture.com"
+            self.fapi_url = "https://testnet.binancefuture.com/fapi/v1"
+        else:
+            self.base_url = "https://fapi.binance.com"
+            self.fapi_url = "https://fapi.binance.com/fapi/v1"
+        
+        # Setup session with retry strategy
+        self.session = requests.Session()
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+        
+        # Set default headers
+        self.session.headers.update({
+            'X-MBX-APIKEY': self.api_key,
+            'Content-Type': 'application/json'
+        })
+        
+        # Sync time on initialization
+        self._sync_time()
+    
+    def _sync_time(self):
+        """Synchronize time with Binance server"""
+        try:
+            server_time_response = self.get_server_time()
+            server_time = server_time_response['serverTime']
+            local_time = int(time.time() * 1000)
+            
+            # Calculate offset (server time - local time)
+            self.time_offset = server_time - local_time
+            print(f"Time synchronized. Server time: {server_time}, Local time: {local_time}, Offset: {self.time_offset}ms")
+            
+        except Exception as e:
+            print(f"Warning: Could not sync time: {e}")
+            self.time_offset = 0
+    
+    def _get_timestamp(self) -> int:
+        """Get current timestamp synchronized with server"""
+        local_time = int(time.time() * 1000)
+        # Apply offset and add small buffer to ensure we're not ahead
+        synchronized_time = local_time + self.time_offset - 1000  # Subtract 1 second buffer
+        return synchronized_time
+    
+    def _make_request(self, method: str, endpoint: str, params: Dict = None, signed: bool = False) -> Dict:
+        """Make HTTP request to Binance API"""
+        if params is None:
+            params = {}
+        
+        url = f"{self.fapi_url}/{endpoint}"
+        
+        if signed:
+            # Handle timestamp synchronization issues
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    params['timestamp'] = self._get_timestamp()
+                    query_string = urllib.parse.urlencode(params)
+                    params['signature'] = self._generate_signature(query_string)
+                    
+                    if method.upper() == 'GET':
+                        response = self.session.get(url, params=params, timeout=self.timeout)
+                    elif method.upper() == 'POST':
+                        response = self.session.post(url, data=params, timeout=self.timeout)
+                    elif method.upper() == 'DELETE':
+                        response = self.session.delete(url, params=params, timeout=self.timeout)
+                    else:
+                        raise ValueError(f"Unsupported HTTP method: {method}")
+                    
+                    response.raise_for_status()
+                    
+                    if not response.content:
+                        return {}
+                    
+                    return response.json()
+                    
+                except requests.exceptions.RequestException as e:
+                    if hasattr(e, 'response') and e.response is not None:
+                        try:
+                            error_data = e.response.json()
+                            error_code = error_data.get('code')
+                            
+                            # Handle timestamp errors specifically
+                            if error_code == -1021:  # Timestamp error
+                                print(f"Timestamp error on attempt {attempt + 1}, resyncing time...")
+                                self._sync_time()
+                                if attempt < max_retries - 1:
+                                    time.sleep(0.5)  # Brief pause before retry
+                                    continue
+                            
+                            print(f"API Error: {error_data}")
+                            raise Exception(f"API Error {error_code}: {error_data.get('msg', str(e))}")
+                        except json.JSONDecodeError:
+                            pass
+                    
+                    if attempt == max_retries - 1:
+                        raise Exception(f"Request failed after {max_retries} attempts: {str(e)}")
+        else:
+            # Non-signed requests
+            try:
+                if method.upper() == 'GET':
+                    response = self.session.get(url, params=params, timeout=self.timeout)
+                elif method.upper() == 'POST':
+                    response = self.session.post(url, data=params, timeout=self.timeout)
+                elif method.upper() == 'DELETE':
+                    response = self.session.delete(url, params=params, timeout=self.timeout)
+                else:
+                    raise ValueError(f"Unsupported HTTP method: {method}")
+                
+                response.raise_for_status()
+                
+                if not response.content:
+                    return {}
+                
+                return response.json()
+                
+            except requests.exceptions.RequestException as e:
+                print(f"Request error: {e}")
+                if hasattr(e, 'response') and e.response is not None:
+                    try:
+                        error_data = e.response.json()
+                        print(f"API Error: {error_data}")
+                        raise Exception(f"API Error {error_data.get('code', 'Unknown')}: {error_data.get('msg', str(e))}")
+                    except:
+                        pass
+                raise Exception(f"Request failed: {str(e)}")
+     
+    def ping(self) -> Dict:
+        """Test connectivity"""
+        return self._make_request('GET', 'ping')
+
+    def get_server_time(self) -> Dict:
+        """Get server time"""
+        return self._make_request('GET', 'time')
+
+    def get_exchange_info(self) -> Dict:
+        """Get exchange trading rules and symbol information"""
+        return self._make_request('GET', 'exchangeInfo')
+
+    def get_account_info(self) -> Dict:
+        """Get account information"""
+        return self._make_request('GET', 'account', signed=True)
+
+    def get_balance(self) -> List[Dict]:
+        """Get account balance"""
+        return self._make_request('GET', 'balance', signed=True)
+
+    def get_position_info(self, symbol: str = None) -> List[Dict]:
+        """Get position information"""
+        params = {}
+        if symbol:
+            params['symbol'] = symbol.upper()
+        return self._make_request('GET', 'positionRisk', params, signed=True)
+
+    def get_open_orders(self, symbol: str = None) -> List[Dict]:
+        """Get open orders"""
+        params = {}
+        if symbol:
+            params['symbol'] = symbol.upper()
+        return self._make_request('GET', 'openOrders', params, signed=True)
+
+    def get_ticker_price(self, symbol: str) -> Dict:
+        """Get symbol price ticker"""
+        params = {'symbol': symbol.upper()}
+        return self._make_request('GET', 'ticker/price', params)
+
+    def place_order(self, symbol: str, side: str, order_type: str, **kwargs) -> Dict:
+        """Place a new order"""
+        params = {
+            'symbol': symbol.upper(),
+            'side': side.upper(),
+            'type': order_type.upper()
+        }
+        
+        # Handle quantity parameter
+        if 'quantity' in kwargs:
+            params['quantity'] = str(kwargs['quantity'])
+        
+        # Handle price parameter for limit orders
+        if 'price' in kwargs:
+            params['price'] = str(kwargs['price'])
+        
+        # Handle timeInForce for limit orders
+        if 'timeInForce' in kwargs:
+            params['timeInForce'] = kwargs['timeInForce']
+        elif order_type.upper() == 'LIMIT':
+            params['timeInForce'] = 'GTC'  # Default to Good Till Cancelled
+        
+        # Add any other parameters
+        for key, value in kwargs.items():
+            if key not in ['quantity', 'price', 'timeInForce']:
+                params[key] = str(value)
+        
+        return self._make_request('POST', 'order', params, signed=True)
+
+    def cancel_order(self, symbol: str, order_id: int) -> Dict:
+        """Cancel an order"""
+        params = {
+            'symbol': symbol.upper(),
+            'orderId': order_id
+        }
+        return self._make_request('DELETE', 'order', params, signed=True)
+
+    def get_order(self, symbol: str, order_id: int) -> Dict:
+        """Get order status"""
+        params = {
+            'symbol': symbol.upper(),
+            'orderId': order_id
+        }
+        return self._make_request('GET', 'order', params, signed=True)
+    def _generate_signature(self, query_string: str) -> str:
+        """Generate HMAC SHA256 signature for authenticated requests"""
+        return hmac.new(
+            self.api_secret.encode('utf-8'),
+            query_string.encode('utf-8'),
+            hashlib.sha256
+        ).hexdigest()
+
+# Also update the TimestampSync class to work better with the RequestsAPIClient
 class TimestampSync:
     """Handle timestamp synchronization with Binance servers"""
     
@@ -37,18 +294,30 @@ class TimestampSync:
     def sync_time(self, client):
         """Synchronize time with Binance server"""
         try:
-            # Get server time
-            server_time_response = client.futures_time()
-            server_time = server_time_response['serverTime']
+            if hasattr(client, 'get_server_time'):
+                # Using requests client
+                server_time_response = client.get_server_time()
+                server_time = server_time_response['serverTime']
+            else:
+                # Using python-binance client
+                server_time_response = client.get_server_time()
+                server_time = server_time_response['serverTime']
             
             # Get local time in milliseconds
             local_time = int(time.time() * 1000)
             
-            # Calculate offset
-            self.time_offset = server_time - local_time
+            # Calculate offset with safety buffer
+            raw_offset = server_time - local_time
+            # Add buffer to ensure we're slightly behind server time
+            self.time_offset = raw_offset - 1000  # 1 second buffer
             self.last_sync = time.time()
             
-            print(f"Time synchronized. Offset: {self.time_offset}ms")
+            print(f"Time synchronized. Raw offset: {raw_offset}ms, Applied offset: {self.time_offset}ms")
+            
+            # Update client's time offset if it's the requests client
+            if hasattr(client, 'time_offset'):
+                client.time_offset = self.time_offset
+            
             return True
             
         except Exception as e:
@@ -99,692 +368,298 @@ class TradingBotLogger:
     def get_logger(self):
         return self.logger
 
-class BasicBot:
-    """Fixed Trading Bot for Binance Futures Testnet with Timestamp Sync"""
+class EnhancedTradingBot:
+    """Enhanced trading bot with requests integration and fallback mechanisms"""
     
-    def __init__(self, api_key: str, api_secret: str, testnet: bool = True):
+    def __init__(self, api_key: str, api_secret: str, testnet: bool = True, use_requests_only: bool = False):
         """
-        Initialize the trading bot
+        Initialize the enhanced trading bot
         
         Args:
-            api_key: Binance API key
+            api_key: Binance API key  
             api_secret: Binance API secret
             testnet: Use testnet environment (default: True)
+            use_requests_only: Use only requests client, not python-binance (default: False)
         """
         self.testnet = testnet
+        self.use_requests_only = use_requests_only
         self.logger = TradingBotLogger().get_logger()
         self.time_sync = TimestampSync()
         
-        try:
-            # Initialize client for testnet
-            if testnet:
-                self.client = Client(
-                    api_key=api_key,
-                    api_secret=api_secret,
-                    testnet=True
-                )
-                self.logger.info("Using Binance Futures Testnet")
-            else:
-                self.client = Client(
-                    api_key=api_key,
-                    api_secret=api_secret,
-                    testnet=False
-                )
-                self.logger.info("Using Binance Futures Mainnet")
-            
-            # Synchronize time with server
-            print("Synchronizing time with Binance servers...")
-            if not self.time_sync.sync_time(self.client):
-                print("Warning: Time synchronization failed. Proceeding anyway.")
-            
-            self.logger.info("Trading bot initialized successfully")
-            self._test_connection()
-            
-        except Exception as e:
-            self.logger.error(f"Failed to initialize trading bot: {e}")
-            self._log_detailed_error(e)
-            raise
-    
-    def _ensure_time_sync(self):
-        """Ensure time is synchronized before API calls"""
-        if self.time_sync.should_resync():
-            self.time_sync.sync_time(self.client)
-    
-    def _log_detailed_error(self, error):
-        """Log detailed error information"""
-        if isinstance(error, BinanceAPIException):
-            self.logger.error(f"Binance API Error Details:")
-            self.logger.error(f"  Status Code: {error.status_code}")
-            self.logger.error(f"  Error Code: {error.code}")
-            self.logger.error(f"  Error Message: {error.message}")
-            if hasattr(error, 'response') and error.response:
-                self.logger.error(f"  Full Response: {error.response}")
-                
-            # Specific handling for timestamp errors
-            if error.code == -1021:
-                print("\n🕐 TIMESTAMP ERROR DETECTED!")
-                print("Your system time is not synchronized with Binance servers.")
-                print("Solutions:")
-                print("1. Synchronize your system clock")
-                print("2. Use NTP time synchronization")
-                print("3. Restart the bot (it will auto-sync)")
-                
-                # Try to resync time
-                print("Attempting to resync time...")
-                if self.time_sync.sync_time(self.client):
-                    print("✓ Time resynchronized successfully!")
+        # Initialize clients
+        self.requests_client = RequestsAPIClient(api_key, api_secret, testnet)
+        
+        if Client and not use_requests_only:
+            try:
+                if testnet:
+                    self.binance_client = Client(
+                        api_key=api_key,
+                        api_secret=api_secret,
+                        testnet=True,
+                        tld='com'
+                    )
                 else:
-                    print("✗ Time resync failed")
+                    self.binance_client = Client(
+                        api_key=api_key,
+                        api_secret=api_secret,
+                        testnet=False,
+                        tld='com'
+                    )
+                self.logger.info("Both requests and python-binance clients initialized")
+            except Exception as e:
+                self.logger.warning(f"Failed to initialize python-binance client: {e}")
+                self.binance_client = None
+                self.use_requests_only = True
         else:
-            self.logger.error(f"General Error: {str(error)}")
-            self.logger.error(f"Error Type: {type(error).__name__}")
+            self.binance_client = None
+            self.use_requests_only = True
+            
+        if self.use_requests_only:
+            self.logger.info("Using requests-only mode")
+        
+        # Test connection
+        self._test_connection()
+    
+    def _make_api_call(self, method_name: str, *args, **kwargs):
+        """Make API call with fallback between clients"""
+        if not self.use_requests_only and self.binance_client:
+            try:
+                # Try python-binance first
+                method = getattr(self.binance_client, method_name, None)
+                if method:
+                    return method(*args, **kwargs)
+            except Exception as e:
+                self.logger.warning(f"python-binance method {method_name} failed: {e}")
+                # Fall back to requests client
+        
+        # Use requests client
+        return self._make_requests_call(method_name, *args, **kwargs)
+    
+    def _make_requests_call(self, method_name: str, *args, **kwargs):
+        """Make API call using requests client"""
+        method_mapping = {
+            'get_server_time': 'get_server_time',
+            'futures_exchange_info': 'get_exchange_info', 
+            'futures_account_balance': 'get_balance',
+            'futures_position_information': 'get_position_info',
+            'futures_get_open_orders': 'get_open_orders',
+            'futures_symbol_ticker': 'get_ticker_price',
+            'futures_create_order': 'place_order',
+            'futures_cancel_order': 'cancel_order',
+            'futures_get_order': 'get_order'
+        }
+        
+        requests_method = method_mapping.get(method_name)
+        if not requests_method:
+            raise NotImplementedError(f"Method {method_name} not implemented in requests client")
+        
+        method = getattr(self.requests_client, requests_method)
+        return method(*args, **kwargs)
     
     def _test_connection(self):
-        """Test API connection and log account information"""
+        """Test API connection"""
         try:
             self.logger.info("Testing API connection...")
             
-            # Test server time first
-            server_time = self.client.futures_time()
-            self.logger.info(f"Server time: {datetime.fromtimestamp(server_time['serverTime'] / 1000)}")
+            # Test server time
+            server_time = self.requests_client.get_server_time()
+            self.logger.info(f"✓ Server time: {datetime.fromtimestamp(server_time['serverTime'] / 1000)}")
             
-            # Test account info with detailed error handling
+            # Test exchange info
+            exchange_info = self.requests_client.get_exchange_info()
+            symbol_count = len(exchange_info.get('symbols', []))
+            self.logger.info(f"✓ Exchange info: {symbol_count} symbols available")
+            
+            # Test account access
             try:
-                account_info = self.client.futures_account()
-                self.logger.info("API connection successful - futures_account() worked")
-                balance = account_info.get('totalWalletBalance', '0')
-                self.logger.info(f"Account balance: {balance} USDT")
-                return True
-            except BinanceAPIException as e:
-                if e.code == -1021:
-                    print("Time synchronization issue detected during connection test.")
-                    self._log_detailed_error(e)
-                    return False
-                    
-                self.logger.warning(f"futures_account() failed: {e.message} (Code: {e.code})")
-                self._log_detailed_error(e)
-                
-                # Try alternative method for testnet
-                self.logger.info("Trying alternative API methods...")
-                
-                try:
-                    balance = self.client.futures_account_balance()
-                    self.logger.info("Alternative API connection successful - futures_account_balance() worked")
-                    total_balance = sum(float(b['balance']) for b in balance if b['asset'] == 'USDT')
-                    self.logger.info(f"USDT Balance: {total_balance}")
-                    return True
-                except Exception as e2:
-                    self.logger.error(f"Alternative API method also failed: {e2}")
-                    self._log_detailed_error(e2)
-                    
-                    # Try even more basic test
-                    try:
-                        positions = self.client.futures_position_information()
-                        self.logger.info("Basic API test successful - futures_position_information() worked")
-                        return True
-                    except Exception as e3:
-                        self.logger.error(f"Basic API test also failed: {e3}")
-                        self._log_detailed_error(e3)
-                        return False
+                balance = self.requests_client.get_balance()
+                self.logger.info(f"✓ Account access: {len(balance)} assets")
+            except Exception as e:
+                self.logger.warning(f"Account access limited: {e}")
+            
+            # Sync time
+            self.time_sync.sync_time(self.requests_client)
+            
+            self.logger.info("✅ Connection test passed!")
+            return True
             
         except Exception as e:
-            self.logger.error(f"API connection test failed: {e}")
-            self._log_detailed_error(e)
+            self.logger.error(f"Connection test failed: {e}")
             return False
     
-    def _safe_float_conversion(self, value, default=0.0):
-        """Safely convert a value to float, returning default if conversion fails"""
-        try:
-            if value is None or value == 'N/A' or value == '':
-                return default
-            return float(value)
-        except (ValueError, TypeError):
-            return default
-    
     def get_account_info(self) -> Dict[str, Any]:
-        """Get account information with enhanced error handling and time sync"""
+        """Get account information with enhanced error handling"""
         try:
-            self._ensure_time_sync()
-            self.logger.info("Attempting to get account information...")
+            # Get balance info
+            balance_info = self.requests_client.get_balance()
             
-            # Try primary method first
-            try:
-                account_info = self.client.futures_account()
-                if account_info is None:
-                    raise Exception("futures_account() returned None")
-                self.logger.info("Account information retrieved successfully using futures_account()")
-                return account_info
-            except BinanceAPIException as e:
-                if e.code == -1021:
-                    print("Timestamp error detected. Attempting to resync...")
-                    if self.time_sync.sync_time(self.client):
-                        print("Time resynced. Retrying...")
-                        account_info = self.client.futures_account()
-                        if account_info is None:
-                            raise Exception("futures_account() returned None after time sync")
-                        return account_info
-                    else:
-                        raise Exception("Failed to sync time and retrieve account info")
-                
-                self.logger.warning(f"futures_account() failed with error {e.code}: {e.message}")
-                self._log_detailed_error(e)
-                
-                # Try alternative methods
-                self.logger.info("Trying alternative methods to get account information...")
-                
-                try:
-                    # Method 1: Get balance and positions separately
-                    balance = self.client.futures_account_balance()
-                    positions = self.client.futures_position_information()
-                    
-                    # Check if responses are None
-                    if balance is None:
-                        balance = []
-                    if positions is None:
-                        positions = []
-                    
-                    # Construct account info from separate calls
-                    usdt_balance = 0
-                    available_balance = 0
-                    for b in balance:
-                        if b and b.get('asset') == 'USDT':
-                            usdt_balance = self._safe_float_conversion(b.get('balance', 0))
-                            available_balance = self._safe_float_conversion(b.get('availableBalance', 0))
-                            break
-                    
-                    total_unrealized_pnl = 0
-                    for p in positions:
-                        if p and p.get('unrealizedProfit'):
-                            total_unrealized_pnl += self._safe_float_conversion(p.get('unrealizedProfit', 0))
-                    
-                    account_info = {
-                        'totalWalletBalance': str(usdt_balance),
-                        'availableBalance': str(available_balance),
-                        'totalUnrealizedProfit': str(total_unrealized_pnl),
-                        'positions': positions,
-                        'assets': balance
-                    }
-                    
-                    self.logger.info("Account information retrieved using alternative method")
-                    return account_info
-                    
-                except Exception as e2:
-                    if isinstance(e2, BinanceAPIException) and e2.code == -1021:
-                        print("Timestamp error in alternative method. Please check your system time.")
-                        
-                    self.logger.error(f"Alternative method 1 failed: {e2}")
-                    self._log_detailed_error(e2)
-                    
-                    # Return safe fallback with numeric values instead of 'N/A'
-                    return {
-                        'totalWalletBalance': '0.0',
-                        'availableBalance': '0.0',
-                        'totalUnrealizedProfit': '0.0',
-                        'positions': [],
-                        'assets': [],
-                        'status': 'API Error - Limited access',
-                        'error': True
-                    }
-                
-                raise
+            # Get position info  
+            positions_info = self.requests_client.get_position_info()
+            
+            # Calculate totals
+            usdt_balance = 0.0
+            for balance in balance_info:
+                if balance.get('asset') == 'USDT':
+                    usdt_balance = float(balance.get('balance', 0))
+                    break
+            
+            total_unrealized_pnl = sum(
+                float(pos.get('unRealizedProfit', 0)) 
+                for pos in positions_info 
+                if float(pos.get('positionAmt', 0)) != 0
+            )
+            
+            return {
+                'totalWalletBalance': str(usdt_balance),
+                'availableBalance': str(usdt_balance),  # Simplified
+                'totalUnrealizedProfit': str(total_unrealized_pnl),
+                'positions': positions_info,
+                'assets': balance_info,
+                'status': 'OK'
+            }
+            
         except Exception as e:
-            self.logger.error(f"Unexpected error getting account info: {e}")
-            self._log_detailed_error(e)
-            # Return safe fallback instead of raising
+            self.logger.error(f"Error getting account info: {e}")
             return {
                 'totalWalletBalance': '0.0',
-                'availableBalance': '0.0',
+                'availableBalance': '0.0', 
                 'totalUnrealizedProfit': '0.0',
                 'positions': [],
                 'assets': [],
-                'status': 'Unexpected Error',
-                'error': True
+                'status': 'Error',
+                'error': True,
+                'error_message': str(e)
             }
-    
-    def get_account_balance_safe(self) -> Dict[str, float]:
-        """Get account balance with safe float conversion"""
-        try:
-            account_info = self.get_account_info()
-            
-            return {
-                'total_balance': self._safe_float_conversion(account_info.get('totalWalletBalance', 0)),
-                'available_balance': self._safe_float_conversion(account_info.get('availableBalance', 0)),
-                'unrealized_pnl': self._safe_float_conversion(account_info.get('totalUnrealizedProfit', 0)),
-                'has_error': account_info.get('error', False)
-            }
-        except Exception as e:
-            self.logger.error(f"Error getting safe account balance: {e}")
-            return {
-                'total_balance': 0.0,
-                'available_balance': 0.0,
-                'unrealized_pnl': 0.0,
-                'has_error': True
-            }
-    
-    def get_open_orders(self, symbol: str = None) -> List[Dict[str, Any]]:
-        """Get open orders with enhanced error handling and timestamp sync"""
-        try:
-            self._ensure_time_sync()
-            
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    if symbol:
-                        orders = self.client.futures_get_open_orders(symbol=symbol.upper())
-                    else:
-                        orders = self.client.futures_get_open_orders()
-                    
-                    if orders is None:
-                        orders = []
-                    
-                    self.logger.info(f"Retrieved {len(orders)} open orders")
-                    return orders
-                    
-                except BinanceAPIException as e:
-                    if e.code == -1021:
-                        print(f"Timestamp error (attempt {attempt + 1}/{max_retries}). Resyncing time...")
-                        if self.time_sync.sync_time(self.client):
-                            print("Time resynced. Retrying...")
-                            time.sleep(0.5)  # Small delay before retry
-                            continue
-                        else:
-                            print("Failed to sync time")
-                    
-                    self.logger.error(f"Binance API error getting open orders: {e}")
-                    self._log_detailed_error(e)
-                    if attempt == max_retries - 1:  # Last attempt
-                        return []  # Return empty list instead of raising
-                    else:
-                        time.sleep(1)  # Wait before retry
-                        
-        except Exception as e:
-            self.logger.error(f"Unexpected error getting open orders: {e}")
-            self._log_detailed_error(e)
-            return []  # Return empty list instead of raising
-    
-    def get_symbol_info(self, symbol: str) -> Dict[str, Any]:
-        """Get symbol information and trading rules"""
-        try:
-            self._ensure_time_sync()
-            exchange_info = self.client.futures_exchange_info()
-            symbol_info = None
-            
-            for s in exchange_info['symbols']:
-                if s['symbol'] == symbol.upper():
-                    symbol_info = s
-                    break
-            
-            if not symbol_info:
-                raise ValueError(f"Symbol {symbol} not found")
-            
-            self.logger.info(f"Symbol info retrieved for {symbol}")
-            return symbol_info
-        except Exception as e:
-            self.logger.error(f"Error getting symbol info for {symbol}: {e}")
-            self._log_detailed_error(e)
-            raise
-    
-    def _validate_order_params(self, symbol: str, side: str, order_type: str, quantity: float, price: float = None) -> tuple:
-        """Validate order parameters"""
-        try:
-            # Get symbol info for validation
-            symbol_info = self.get_symbol_info(symbol)
-            
-            # Validate side
-            if side.upper() not in ['BUY', 'SELL']:
-                raise ValueError("Side must be 'BUY' or 'SELL'")
-            
-            # Validate order type
-            valid_types = ['MARKET', 'LIMIT', 'STOP_MARKET', 'STOP', 'TAKE_PROFIT_MARKET', 'TAKE_PROFIT']
-            if order_type.upper() not in valid_types:
-                raise ValueError(f"Order type must be one of: {valid_types}")
-            
-            # Get filters
-            filters = symbol_info.get('filters')
-            if not filters:
-                raise ValueError(f"No filters found for symbol: {symbol}")
-
-            filters = {f['filterType']: f for f in filters}
-
-            lot_size = filters.get('LOT_SIZE')
-            if lot_size is None:
-                raise ValueError(f"LOT_SIZE filter missing for {symbol}")
-            
-            min_qty = float(lot_size.get('minQty', 0))
-            max_qty = float(lot_size.get('maxQty', float('inf')))
-            step_size = float(lot_size.get('stepSize', 1))
-            
-            if quantity < min_qty:
-                raise ValueError(f"Quantity {quantity} is below minimum {min_qty}")
-            if quantity > max_qty:
-                raise ValueError(f"Quantity {quantity} exceeds maximum {max_qty}")
-            
-            # Round quantity to step size
-            quantity = float(Decimal(str(quantity)).quantize(
-                Decimal(str(step_size)), rounding=ROUND_DOWN
-            ))
-            
-            # Validate price for limit orders
-            if order_type.upper() in ['LIMIT', 'STOP', 'TAKE_PROFIT'] and price is not None:
-                price_filter = filters.get('PRICE_FILTER')
-                if price_filter is None:
-                    raise ValueError(f"PRICE_FILTER filter missing for {symbol}")
-                min_price = float(price_filter.get('minPrice', 0))
-                max_price = float(price_filter.get('maxPrice', float('inf')))
-                tick_size = float(price_filter.get('tickSize', 0.01))
-
-                if price < min_price:
-                    raise ValueError(f"Price {price} is below minimum {min_price}")
-                if price > max_price:
-                    raise ValueError(f"Price {price} exceeds maximum {max_price}")
-
-                price = float(Decimal(str(price)).quantize(
-                        Decimal(str(tick_size)), rounding=ROUND_DOWN
-                    ))
-                # Round price to tick size
-                price = float(Decimal(str(price)).quantize(
-                    Decimal(str(tick_size)), rounding=ROUND_DOWN
-                ))
-            
-            return quantity, price
-            
-        except Exception as e:
-            self.logger.error(f"Order validation failed: {e}")
-            self._log_detailed_error(e)
-            raise
-   
-    def _safe_order_response(self, order_response):
-        """Safely handle order response that might be None"""
-        if order_response is None:
-            self.logger.error("Order response is None — this should not happen unless the API call failed silently.")
-            return {
-                'orderId': 'Unknown',
-                'status': 'Error - No response received',
-                'executedQty': '0',
-                'cummulativeQuoteQty': '0',
-                'price': '0',
-                'stopPrice': '0',
-                'symbol': 'Unknown',
-                'side': 'Unknown',
-                'type': 'Unknown',
-                'origQty': '0',
-                'avgPrice': '0',
-                'time': 0
-            }
-        return order_response
-    
-    def place_market_order(self, symbol: str, side: str, quantity: float) -> Dict[str, Any]:
-        """Place a market order with enhanced error handling and timestamp sync"""
-        order = self.client.futures_create_order(...)
-        self.logger.debug(f"Raw order response: {order}")  
-        try:
-            self._ensure_time_sync()
-
-            # Validate parameters
-            quantity, _ = self._validate_order_params(symbol, side, 'MARKET', quantity)
-
-            self.logger.info(f"Placing market order: {side} {quantity} {symbol}")
-
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    order = self.client.futures_create_order(
-                        symbol=symbol.upper(),
-                        side=side.upper(),
-                        type=ORDER_TYPE_MARKET,
-                        quantity=quantity
-                    )
-
-                    self.logger.debug(f"Raw order response: {order}")  # Log raw response
-                    order = self._safe_order_response(order)
-
-                    self.logger.info(f"Market order placed successfully: {order}")
-                    return order
-
-                except BinanceAPIException as e:
-                    if e.code == -1021:
-                        print(f"Timestamp error in order placement (attempt {attempt + 1}/{max_retries})")
-                        if self.time_sync.sync_time(self.client):
-                            print("Time resynced. Retrying order...")
-                            time.sleep(0.5)
-                            continue
-
-                    self.logger.error(f"Binance API error placing market order: {e}")
-                    self._log_detailed_error(e)
-
-                    # Specific error guidance
-                    if e.code == -2019:
-                        print("Error: Insufficient margin balance")
-                    elif e.code == -1013:
-                        print("Error: Invalid quantity or price filter")
-                    elif e.code == -4014:
-                        print("Error: Price exceeds maximum allowed")
-
-                    if attempt == max_retries - 1:
-                        raise
-                    else:
-                        time.sleep(1)
-
-        except Exception as e:
-            self.logger.error(f"Unexpected error placing market order: {e}")
-            self._log_detailed_error(e)
-            raise
-
-    def place_limit_order(self, symbol: str, side: str, quantity: float, price: float) -> Dict[str, Any]:
-        """Place a limit order with enhanced error handling and timestamp sync"""
-        try:
-            self._ensure_time_sync()
-
-            # Validate parameters
-            quantity, price = self._validate_order_params(symbol, side, 'LIMIT', quantity, price)
-
-            self.logger.info(f"Placing limit order: {side} {quantity} {symbol} at {price}")
-
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    order = self.client.futures_create_order(
-                        symbol=symbol.upper(),
-                        side=side.upper(),
-                        type=ORDER_TYPE_LIMIT,
-                        timeInForce=TIME_IN_FORCE_GTC,
-                        quantity=quantity,
-                        price=price
-                    )
-
-                    self.logger.debug(f"Raw order response: {order}")  # Log raw response
-                    order = self._safe_order_response(order)
-
-                    self.logger.info(f"Limit order placed successfully: {order}")
-                    return order
-
-                except BinanceAPIException as e:
-                    if e.code == -1021:
-                        print(f"Timestamp error in limit order (attempt {attempt + 1}/{max_retries})")
-                        if self.time_sync.sync_time(self.client):
-                            print("Time resynced. Retrying order...")
-                            time.sleep(0.5)
-                            continue
-
-                    self.logger.error(f"Binance API error placing limit order: {e}")
-                    self._log_detailed_error(e)
-
-                    if e.code == -2019:
-                        print("Error: Insufficient margin balance")
-                    elif e.code == -1013:
-                        print("Error: Invalid quantity or price filter")
-                    elif e.code == -4014:
-                        print("Error: Price exceeds maximum allowed")
-
-                    if attempt == max_retries - 1:
-                        raise
-                    else:
-                        time.sleep(1)
-
-        except Exception as e:
-            self.logger.error(f"Unexpected error placing limit order: {e}")
-            self._log_detailed_error(e)
-            raise
-
-    def cancel_order(self, symbol: str, order_id: int) -> Dict[str, Any]:
-        """Cancel an order with enhanced error handling and timestamp sync"""
-        try:
-            self._ensure_time_sync()
-            self.logger.info(f"Cancelling order {order_id} for {symbol}")
-            
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    result = self.client.futures_cancel_order(
-                        symbol=symbol.upper(),
-                        orderId=order_id
-                    )
-                    
-                    self.logger.info(f"Order cancelled successfully: {result}")
-                    return result
-                    
-                except BinanceAPIException as e:
-                    if e.code == -1021:
-                        print(f"Timestamp error in cancel order (attempt {attempt + 1}/{max_retries})")
-                        if self.time_sync.sync_time(self.client):
-                            print("Time resynced. Retrying cancel...")
-                            time.sleep(0.5)
-                            continue
-                    
-                    self.logger.error(f"Binance API error cancelling order: {e}")
-                    self._log_detailed_error(e)
-                    
-                    if attempt == max_retries - 1:
-                        raise
-                    else:
-                        time.sleep(1)
-                        
-        except Exception as e:
-            self.logger.error(f"Unexpected error cancelling order: {e}")
-            self._log_detailed_error(e)
-            raise
-    
-    def get_order_status(self, symbol: str, order_id: int) -> Dict[str, Any]:
-        """Get order status with enhanced error handling and timestamp sync"""
-        try:
-            self._ensure_time_sync()
-            
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    order = self.client.futures_get_order(
-                        symbol=symbol.upper(),
-                        orderId=order_id
-                    )
-                    
-                    self.logger.info(f"Order status retrieved: {order}")
-                    return order
-                    
-                except BinanceAPIException as e:
-                    if e.code == -1021:
-                        print(f"Timestamp error in get order status (attempt {attempt + 1}/{max_retries})")
-                        if self.time_sync.sync_time(self.client):
-                            print("Time resynced. Retrying...")
-                            time.sleep(0.5)
-                            continue
-                    
-                    self.logger.error(f"Binance API error getting order status: {e}")
-                    self._log_detailed_error(e)
-                    
-                    if attempt == max_retries - 1:
-                        raise
-                    else:
-                        time.sleep(1)
-                        
-        except Exception as e:
-            self.logger.error(f"Unexpected error getting order status: {e}")
-            self._log_detailed_error(e)
-            raise
     
     def get_current_price(self, symbol: str) -> float:
-        """Get current price for a symbol with enhanced error handling and timestamp sync"""
+        """Get current price for a symbol"""
         try:
-            self._ensure_time_sync()
-            ticker = self.client.futures_symbol_ticker(symbol=symbol.upper())
+            ticker = self.requests_client.get_ticker_price(symbol)
             price = float(ticker['price'])
             self.logger.info(f"Current price for {symbol}: {price}")
             return price
-            
-        except BinanceAPIException as e:
-            if e.code == -1021:
-                print("Timestamp error getting price. Resyncing...")
-                if self.time_sync.sync_time(self.client):
-                    ticker = self.client.futures_symbol_ticker(symbol=symbol.upper())
-                    price = float(ticker['price'])
-                    return price
-            
-            self.logger.error(f"Binance API error getting price: {e}")
-            self._log_detailed_error(e)
-            raise
         except Exception as e:
-            self.logger.error(f"Unexpected error getting price: {e}")
-            self._log_detailed_error(e)
+            self.logger.error(f"Error getting price for {symbol}: {e}")
             raise
     
-    def test_api_permissions(self):
-        """Test various API endpoints to check permissions"""
+    def place_market_order(self, symbol: str, side: str, quantity: float) -> Dict[str, Any]:
+        """Place a market order"""
+        try:
+            self.logger.info(f"Placing market order: {side} {quantity} {symbol}")
+            
+            order = self.requests_client.place_order(
+                symbol=symbol,
+                side=side,
+                order_type='MARKET',
+                quantity=quantity
+            )
+            
+            self.logger.info(f"Market order placed: {order}")
+            return order
+            
+        except Exception as e:
+            self.logger.error(f"Error placing market order: {e}")
+            raise
+    
+    def place_limit_order(self, symbol: str, side: str, quantity: float, price: float) -> Dict[str, Any]:
+        """Place a limit order"""
+        try:
+            self.logger.info(f"Placing limit order: {side} {quantity} {symbol} at {price}")
+            
+            order = self.requests_client.place_order(
+                symbol=symbol,
+                side=side,
+                order_type='LIMIT',
+                quantity=quantity,
+                price=price,
+                timeInForce='GTC'
+            )
+            
+            self.logger.info(f"Limit order placed: {order}")
+            return order
+            
+        except Exception as e:
+            self.logger.error(f"Error placing limit order: {e}")
+            raise
+    
+    def get_open_orders(self, symbol: str = None) -> List[Dict[str, Any]]:
+        """Get open orders"""
+        try:
+            orders = self.requests_client.get_open_orders(symbol)
+            self.logger.info(f"Retrieved {len(orders)} open orders")
+            return orders
+        except Exception as e:
+            self.logger.error(f"Error getting open orders: {e}")
+            return []
+    
+    def cancel_order(self, symbol: str, order_id: int) -> Dict[str, Any]:
+        """Cancel an order"""
+        try:
+            result = self.requests_client.cancel_order(symbol, order_id)
+            self.logger.info(f"Order cancelled: {result}")
+            return result
+        except Exception as e:
+            self.logger.error(f"Error cancelling order: {e}")
+            raise
+    
+    def get_order_status(self, symbol: str, order_id: int) -> Dict[str, Any]:
+        """Get order status"""
+        try:
+            order = self.requests_client.get_order(symbol, order_id)
+            self.logger.info(f"Order status: {order}")
+            return order
+        except Exception as e:
+            self.logger.error(f"Error getting order status: {e}")
+            raise
+    
+    def test_requests_features(self):
+        """Test various requests-specific features"""
         results = {}
         
-        # Ensure time sync before testing
-        self._ensure_time_sync()
-        
-        test_functions = [
-            ('Server Time', lambda: self.client.futures_time()),
-            ('Exchange Info', lambda: self.client.futures_exchange_info()),
-            ('Account Balance', lambda: self.client.futures_account_balance()),
-            ('Position Info', lambda: self.client.futures_position_information()),
-            ('Account Info', lambda: self.client.futures_account()),
-            ('Open Orders', lambda: self.client.futures_get_open_orders()),
+        # Test direct HTTP methods
+        test_cases = [
+            ('Server Time', lambda: self.requests_client.get_server_time()),
+            ('Exchange Info', lambda: self.requests_client.get_exchange_info()),
+            ('Account Balance', lambda: self.requests_client.get_balance()),
+            ('Position Info', lambda: self.requests_client.get_position_info()),
+            ('Open Orders', lambda: self.requests_client.get_open_orders()),
         ]
         
-        for test_name, test_func in test_functions:
+        for test_name, test_func in test_cases:
             try:
                 result = test_func()
-                results[test_name] = {'status': 'SUCCESS', 'data': 'Available'}
-                self.logger.info(f"{test_name}: SUCCESS")
-            except BinanceAPIException as e:
-                if e.code == -1021:
-                    # Try to resync and retry once
-                    try:
-                        self.time_sync.sync_time(self.client)
-                        result = test_func()
-                        results[test_name] = {'status': 'SUCCESS (after time sync)', 'data': 'Available'}
-                        self.logger.info(f"{test_name}: SUCCESS (after time sync)")
-                    except Exception as e2:
-                        results[test_name] = {'status': 'FAILED', 'error': f"Code {e.code}: {e.message}"}
-                        self.logger.warning(f"{test_name}: FAILED - {e.code}: {e.message}")
-                else:
-                    results[test_name] = {'status': 'FAILED', 'error': f"Code {e.code}: {e.message}"}
-                    self.logger.warning(f"{test_name}: FAILED - {e.code}: {e.message}")
+                results[test_name] = {
+                    'status': 'SUCCESS',
+                    'data_type': type(result).__name__,
+                    'data_size': len(result) if isinstance(result, (list, dict)) else 'N/A'
+                }
+                self.logger.info(f"✓ {test_name}: SUCCESS")
             except Exception as e:
-                results[test_name] = {'status': 'ERROR', 'error': str(e)}
-                self.logger.error(f"{test_name}: ERROR - {e}")
+                results[test_name] = {
+                    'status': 'FAILED', 
+                    'error': str(e)
+                }
+                self.logger.warning(f"✗ {test_name}: FAILED - {e}")
         
         return results
 
-class TradingBotCLI:
-    """Command Line Interface for the Trading Bot with enhanced diagnostics"""
+class EnhancedTradingBotCLI:
+    """Enhanced CLI with requests integration"""
     
     def __init__(self):
         self.bot = None
         self.logger = TradingBotLogger().get_logger()
     
-    def initialize_bot(self):
-        """Initialize the trading bot with API credentials"""
-        print("=== Binance Futures Trading Bot ===")
+    def initialize_bot(self, use_requests_only: bool = False):
+        """Initialize the enhanced trading bot"""
+        print("=== Enhanced Binance Futures Trading Bot ===")
         print("Initializing bot with API credentials...")
         
-        # Try to get credentials from environment first
+        # Get credentials
         api_key = os.getenv('BINANCE_API_KEY')
         api_secret = os.getenv('BINANCE_API_SECRET')
         
         if not api_key or not api_secret:
-            # Get API credentials from user input
             api_key = input("Enter your Binance API Key: ").strip()
             api_secret = input("Enter your Binance API Secret: ").strip()
         else:
@@ -795,20 +670,13 @@ class TradingBotCLI:
             return False
         
         try:
-            self.bot = BasicBot(api_key, api_secret, testnet=True)
-            print("✓ Bot initialized successfully!")
-            
-            # Run API permissions test
-            print("\nTesting API permissions...")
-            test_results = self.bot.test_api_permissions()
-            
-            print("\nAPI Test Results:")
-            for test_name, result in test_results.items():
-                status_symbol = "✓" if result['status'] == 'SUCCESS' else "✗"
-                print(f"  {status_symbol} {test_name}: {result['status']}")
-                if result['status'] != 'SUCCESS':
-                    print(f"    Error: {result.get('error', 'Unknown error')}")
-            
+            self.bot = EnhancedTradingBot(
+                api_key, 
+                api_secret, 
+                testnet=True,
+                use_requests_only=use_requests_only
+            )
+            print("✓ Enhanced bot initialized successfully!")
             return True
         except Exception as e:
             print(f"✗ Failed to initialize bot: {e}")
@@ -816,9 +684,9 @@ class TradingBotCLI:
     
     def display_menu(self):
         """Display the main menu"""
-        print("\n" + "="*50)
-        print("         TRADING BOT MENU")
-        print("="*50)
+        print("\n" + "="*60)
+        print("         ENHANCED TRADING BOT MENU")
+        print("="*60)
         print("1. Account Information")
         print("2. Get Current Price")
         print("3. Place Market Order")
@@ -826,147 +694,88 @@ class TradingBotCLI:
         print("5. View Open Orders")
         print("6. Cancel Order")
         print("7. Get Order Status")
-        print("8. Test API Permissions")
-        print("9. Log Files Location")
+        print("8. Test Requests Features")
+        print("9. Switch Client Mode")
+        print("10. HTTP Request Demo")
         print("0. Exit")
-        print("="*50)
+        print("="*60)
     
-    def get_user_input(self, prompt: str, input_type: type = str, required: bool = True):
-        """Get validated user input"""
-        while True:
-            try:
-                value = input(f"{prompt}: ").strip()
-                if not value and required:
-                    print("This field is required. Please enter a value.")
-                    continue
-                if not value and not required:
-                    return None
-                return input_type(value)
-            except ValueError:
-                print(f"Invalid input. Please enter a valid {input_type.__name__}.")
-    
-    def handle_account_info(self):
-        """Handle account information request with detailed error display"""
-    try:
-        print("\n--- Account Information ---")
-        account_info = self.bot.get_account_info()
-        
-        # Safe conversion function for balance values
-        def safe_float_convert(value, default=0.0):
-            """Safely convert string to float, handling 'N/A' and None values"""
-            if value is None or value == 'N/A' or value == '':
-                return default
-            try:
-                return float(value)
-            except (ValueError, TypeError):
-                return default
-        
-        # Safe display of balance information
-        total_balance = safe_float_convert(account_info.get('totalWalletBalance', 'N/A'))
-        available_balance = safe_float_convert(account_info.get('availableBalance', 'N/A'))
-        unrealized_pnl = safe_float_convert(account_info.get('totalUnrealizedProfit', 'N/A'))
-
-        
-        print(f"Total Wallet Balance: {total_balance} USDT")
-        print(f"Available Balance: {available_balance} USDT")
-        print(f"Total Unrealized PnL: {unrealized_pnl} USDT")
-        
-        # Show status if available
-        if 'status' in account_info:
-            print(f"Status: {account_info['status']}")
-        
-        # Show positions with safe float handling
-        positions = account_info.get('positions', [])
-        if positions:
-            active_positions = []
-            for p in positions:
-                position_amt = safe_float_convert(p.get('positionAmt', 0))
-                if position_amt != 0:
-                    active_positions.append(p)
-            
-            if active_positions:
-                print("\nActive Positions:")
-                for pos in active_positions:
-                    pos_amt = pos.get('positionAmt', '0')
-                    unrealized_profit = pos.get('unrealizedProfit', '0')
-                    print(f"  {pos['symbol']}: {pos_amt} (PnL: {unrealized_profit})")
-            else:
-                print("\nNo active positions")
-        
-        # Show assets if available with safe float handling
-        assets = account_info.get('assets', [])
-        if assets:
-            print("\nAsset Balance:")
-            for asset in assets:
-                balance = safe_float_convert(asset.get('balance', 0))
-                if balance > 0:
-                    print(f"  {asset['asset']}: {asset['balance']}")
-            
-    except Exception as e:
-        print(f"Error getting account info: {e}")
-        print("\nTroubleshooting tips:")
-        print("1. Check if your API key has Futures trading permissions")
-        print("2. Ensure your API key is enabled for testnet if using testnet")
-        print("3. Check if your IP is whitelisted (if IP restriction is enabled)")
-        print("4. Verify your system time is synchronized")
-
-    def _safe_order_response(self, order_response):
-        """Safely handle order response that might be None"""
-        if order_response is None:
-            return {
-                'orderId': 'Unknown',
-                'status': 'Error - No response received',
-                'executedQty': '0',
-                'cummulativeQuoteQty': '0',
-                'price': '0',
-                'stopPrice': '0',
-                'symbol': 'Unknown',
-                'side': 'Unknown',
-                'type': 'Unknown',
-                'origQty': '0',
-                'avgPrice': '0',
-                'time': 0
-            }
-        return order_response
-
-    def handle_test_api_permissions(self):
-        """Handle API permissions test"""
+    def handle_requests_test(self):
+        """Handle requests features test"""
         try:
-            print("\n--- API Permissions Test ---")
-            test_results = self.bot.test_api_permissions()
+            print("\n--- Testing Requests Features ---")
+            results = self.bot.test_requests_features()
             
-            print("\nDetailed API Test Results:")
-            for test_name, result in test_results.items():
+            print("\nRequests Client Test Results:")
+            for test_name, result in results.items():
                 status_symbol = "✓" if result['status'] == 'SUCCESS' else "✗"
-                print(f"\n{status_symbol} {test_name}")
-                print(f"  Status: {result['status']}")
-                if result['status'] != 'SUCCESS':
-                    print(f"  Error: {result.get('error', 'Unknown error')}")
+                print(f"{status_symbol} {test_name}: {result['status']}")
+                if result['status'] == 'SUCCESS':
+                    print(f"  Data Type: {result['data_type']}")
+                    print(f"  Data Size: {result['data_size']}")
+                else:
+                    print(f"  Error: {result['error']}")
+        except Exception as e:
+            print(f"Error testing requests features: {e}")
+    
+    def handle_http_demo(self):
+        """Demonstrate raw HTTP requests"""
+        try:
+            print("\n--- HTTP Request Demo ---")
             
-            # Provide recommendations
-            failed_tests = [name for name, result in test_results.items() if result['status'] != 'SUCCESS']
-            if failed_tests:
-                print(f"\n⚠️  {len(failed_tests)} test(s) failed. Recommendations:")
-                if 'Account Info' in failed_tests or 'Account Balance' in failed_tests:
-                    print("  - Check if your API key has 'Enable Futures' permission")
-                    print("  - Ensure you're using the correct testnet API key")
-                if 'Open Orders' in failed_tests:
-                    print("  - Your API key might have read-only permissions")
+            # Demo 1: Public endpoint (no auth)
+            print("1. Testing public endpoint (server time):")
+            response = requests.get("https://testnet.binancefuture.com/fapi/v1/time")
+            if response.status_code == 200:
+                data = response.json()
+                server_time = datetime.fromtimestamp(data['serverTime'] / 1000)
+                print(f"   ✓ Server Time: {server_time}")
             else:
-                print("\n✅ All tests passed! Your API key is properly configured.")
+                print(f"   ✗ Failed: {response.status_code}")
+            
+            # Demo 2: Custom headers
+            print("\n2. Testing with custom headers:")
+            headers = {
+                'User-Agent': 'Enhanced-Trading-Bot/1.0',
+                'Accept': 'application/json'
+            }
+            response = requests.get(
+                "https://testnet.binancefuture.com/fapi/v1/exchangeInfo", 
+                headers=headers,
+                timeout=10
+            )
+            if response.status_code == 200:
+                data = response.json()
+                print(f"   ✓ Exchange Info: {len(data.get('symbols', []))} symbols")
+            else:
+                print(f"   ✗ Failed: {response.status_code}")
+                
+            # Demo 3: Session usage
+            print("\n3. Testing with session:")
+            session = requests.Session()
+            session.headers.update({'User-Agent': 'SessionBot/1.0'})
+            
+            response = session.get("https://testnet.binancefuture.com/fapi/v1/ping")
+            if response.status_code == 200:
+                print("   ✓ Ping successful with session")
+            else:
+                print(f"   ✗ Ping failed: {response.status_code}")
                 
         except Exception as e:
-            print(f"Error testing API permissions: {e}")
+            print(f"HTTP demo error: {e}")
     
     def run(self):
-        """Run the CLI interface"""
-        if not self.initialize_bot():
+        """Run the enhanced CLI"""
+        mode_choice = input("Use requests-only mode? (y/n): ").strip().lower()
+        use_requests_only = mode_choice == 'y'
+        
+        if not self.initialize_bot(use_requests_only):
             return
         
         while True:
             try:
                 self.display_menu()
-                choice = input("\nEnter your choice (0-9): ").strip()
+                choice = input("\nEnter your choice (0-10): ").strip()
                 
                 if choice == '0':
                     print("Goodbye!")
@@ -986,9 +795,11 @@ class TradingBotCLI:
                 elif choice == '7':
                     self.handle_order_status()
                 elif choice == '8':
-                    self.handle_test_api_permissions()
+                    self.handle_requests_test()
                 elif choice == '9':
-                    self.show_log_location()
+                    print("Restart the bot to switch client mode")
+                elif choice == '10':
+                    self.handle_http_demo()
                 else:
                     print("Invalid choice. Please try again.")
                 
@@ -1001,11 +812,39 @@ class TradingBotCLI:
                 print(f"Unexpected error: {e}")
                 self.logger.error(f"CLI error: {e}")
     
-    # ... (rest of the CLI methods remain the same)
+    # Import other CLI methods from the original class
+    def handle_account_info(self):
+        """Handle account information request"""
+        try:
+            print("\n--- Account Information ---")
+            account_info = self.bot.get_account_info()
+            
+            def safe_float_convert(value, default=0.0):
+                if value is None or value == 'N/A' or value == '':
+                    return default
+                try:
+                    return float(value)
+                except (ValueError, TypeError):
+                    return default
+            
+            total_balance = safe_float_convert(account_info.get('totalWalletBalance', 'N/A'))
+            available_balance = safe_float_convert(account_info.get('availableBalance', 'N/A'))
+            unrealized_pnl = safe_float_convert(account_info.get('totalUnrealizedProfit', 'N/A'))
+            
+            print(f"Total Wallet Balance: {total_balance} USDT")
+            print(f"Available Balance: {available_balance} USDT")
+            print(f"Total Unrealized PnL: {unrealized_pnl} USDT")
+            
+            if 'status' in account_info:
+                print(f"Status: {account_info['status']}")
+                
+        except Exception as e:
+            print(f"Error getting account info: {e}")
+    
     def handle_current_price(self):
         """Handle current price request"""
         try:
-            symbol = self.get_user_input("Enter symbol (e.g., BTCUSDT)")
+            symbol = input("Enter symbol (e.g., BTCUSDT): ").strip()
             price = self.bot.get_current_price(symbol)
             print(f"\nCurrent price for {symbol.upper()}: {price} USDT")
         except Exception as e:
@@ -1021,20 +860,13 @@ class TradingBotCLI:
                 print("Order cancelled")
                 return
                 
-            symbol = self.get_user_input("Enter symbol (e.g., BTCUSDT)")
-            side = self.get_user_input("Enter side (BUY/SELL)").upper()
-            quantity = self.get_user_input("Enter quantity", float)
+            symbol = input("Enter symbol (e.g., BTCUSDT): ").strip()
+            side = input("Enter side (BUY/SELL): ").strip().upper()
+            quantity = float(input("Enter quantity: ").strip())
             
             if side not in ['BUY', 'SELL']:
                 print("Error: Side must be BUY or SELL")
                 return
-            
-            # Show current price for reference
-            try:
-                current_price = self.bot.get_current_price(symbol)
-                print(f"Current price: {current_price}")
-            except:
-                pass
             
             print(f"\nPlacing market order: {side} {quantity} {symbol}")
             order = self.bot.place_market_order(symbol, side, quantity)
@@ -1042,8 +874,6 @@ class TradingBotCLI:
             print("✓ Market order placed successfully!")
             print(f"Order ID: {order.get('orderId')}")
             print(f"Status: {order.get('status')}")
-            print(f"Executed Quantity: {order.get('executedQty')}")
-            print(f"Cumulative Quote Quantity: {order.get('cummulativeQuoteQty')}")
             
         except Exception as e:
             print(f"Error placing market order: {e}")
@@ -1052,21 +882,14 @@ class TradingBotCLI:
         """Handle limit order placement"""
         try:
             print("\n--- Place Limit Order ---")
-            symbol = self.get_user_input("Enter symbol (e.g., BTCUSDT)")
-            side = self.get_user_input("Enter side (BUY/SELL)").upper()
-            quantity = self.get_user_input("Enter quantity", float)
-            price = self.get_user_input("Enter price", float)
+            symbol = input("Enter symbol (e.g., BTCUSDT): ").strip()
+            side = input("Enter side (BUY/SELL): ").strip().upper()
+            quantity = float(input("Enter quantity: ").strip())
+            price = float(input("Enter price: ").strip())
             
             if side not in ['BUY', 'SELL']:
                 print("Error: Side must be BUY or SELL")
                 return
-            
-            # Show current price for reference
-            try:
-                current_price = self.bot.get_current_price(symbol)
-                print(f"Current price: {current_price}")
-            except:
-                pass
             
             print(f"\nPlacing limit order: {side} {quantity} {symbol} at {price}")
             order = self.bot.place_limit_order(symbol, side, quantity, price)
@@ -1074,49 +897,16 @@ class TradingBotCLI:
             print("✓ Limit order placed successfully!")
             print(f"Order ID: {order.get('orderId')}")
             print(f"Status: {order.get('status')}")
-            print(f"Price: {order.get('price')}")
             
         except Exception as e:
             print(f"Error placing limit order: {e}")
     
-    def handle_stop_limit_order(self):
-        """Handle stop-limit order placement"""
-        try:
-            print("\n--- Place Stop-Limit Order ---")
-            symbol = self.get_user_input("Enter symbol (e.g., BTCUSDT)")
-            side = self.get_user_input("Enter side (BUY/SELL)").upper()
-            quantity = self.get_user_input("Enter quantity", float)
-            price = self.get_user_input("Enter limit price", float)
-            stop_price = self.get_user_input("Enter stop price", float)
-            
-            if side not in ['BUY', 'SELL']:
-                print("Error: Side must be BUY or SELL")
-                return
-            
-            # Show current price for reference
-            try:
-                current_price = self.bot.get_current_price(symbol)
-                print(f"Current price: {current_price}")
-            except:
-                pass
-            
-            print(f"\nPlacing stop-limit order: {side} {quantity} {symbol} at {price}, stop: {stop_price}")
-            order = self.bot.place_stop_limit_order(symbol, side, quantity, price, stop_price)
-            
-            print("✓ Stop-limit order placed successfully!")
-            print(f"Order ID: {order.get('orderId')}")
-            print(f"Status: {order.get('status')}")
-            print(f"Limit Price: {order.get('price')}")
-            print(f"Stop Price: {order.get('stopPrice')}")
-            
-        except Exception as e:
-            print(f"Error placing stop-limit order: {e}")
-    
     def handle_open_orders(self):
-        """Handle open orders display"""
+        """Handle open orders request"""
         try:
             print("\n--- Open Orders ---")
-            symbol = input("Enter symbol (optional, press Enter for all): ").strip() or None
+            symbol = input("Enter symbol (optional, press Enter for all): ").strip()
+            symbol = symbol if symbol else None
             
             orders = self.bot.get_open_orders(symbol)
             
@@ -1124,7 +914,7 @@ class TradingBotCLI:
                 print("No open orders found")
                 return
             
-            print(f"\nFound {len(orders)} open orders:")
+            print(f"\nFound {len(orders)} open order(s):")
             for order in orders:
                 print(f"Order ID: {order.get('orderId')}")
                 print(f"Symbol: {order.get('symbol')}")
@@ -1133,7 +923,7 @@ class TradingBotCLI:
                 print(f"Quantity: {order.get('origQty')}")
                 print(f"Price: {order.get('price')}")
                 print(f"Status: {order.get('status')}")
-                print("-" * 30)
+                print("-" * 40)
                 
         except Exception as e:
             print(f"Error getting open orders: {e}")
@@ -1142,8 +932,8 @@ class TradingBotCLI:
         """Handle order cancellation"""
         try:
             print("\n--- Cancel Order ---")
-            symbol = self.get_user_input("Enter symbol (e.g., BTCUSDT)")
-            order_id = self.get_user_input("Enter order ID", int)
+            symbol = input("Enter symbol (e.g., BTCUSDT): ").strip()
+            order_id = int(input("Enter order ID: ").strip())
             
             result = self.bot.cancel_order(symbol, order_id)
             
@@ -1158,8 +948,8 @@ class TradingBotCLI:
         """Handle order status request"""
         try:
             print("\n--- Order Status ---")
-            symbol = self.get_user_input("Enter symbol (e.g., BTCUSDT)")
-            order_id = self.get_user_input("Enter order ID", int)
+            symbol = input("Enter symbol (e.g., BTCUSDT): ").strip()
+            order_id = int(input("Enter order ID: ").strip())
             
             order = self.bot.get_order_status(symbol, order_id)
             
@@ -1167,101 +957,35 @@ class TradingBotCLI:
             print(f"Symbol: {order.get('symbol')}")
             print(f"Side: {order.get('side')}")
             print(f"Type: {order.get('type')}")
-            print(f"Status: {order.get('status')}")
             print(f"Original Quantity: {order.get('origQty')}")
             print(f"Executed Quantity: {order.get('executedQty')}")
             print(f"Price: {order.get('price')}")
-            print(f"Average Price: {order.get('avgPrice')}")
-            print(f"Time: {datetime.fromtimestamp(order.get('time', 0) / 1000)}")
+            print(f"Status: {order.get('status')}")
+            print(f"Time in Force: {order.get('timeInForce')}")
             
         except Exception as e:
             print(f"Error getting order status: {e}")
-    
-    def show_log_location(self):
-        """Show log files location"""
-        logs_dir = os.path.abspath('logs')
-        print(f"\nLog files are stored in: {logs_dir}")
-        
-        if os.path.exists(logs_dir):
-            log_files = [f for f in os.listdir(logs_dir) if f.endswith('.log')]
-            if log_files:
-                print(f"Current log files ({len(log_files)}):")
-                for log_file in sorted(log_files):
-                    print(f"  - {log_file}")
-            else:
-                print("No log files found")
-        else:
-            print("Logs directory does not exist yet")
-    
-    def run(self):
-        """Run the CLI interface"""
-        if not self.initialize_bot():
-            return
-        
-        while True:
-            try:
-                self.display_menu()
-                choice = input("\nEnter your choice (0-9): ").strip()
-                
-                if choice == '0':
-                    print("Goodbye!")
-                    break
-                elif choice == '1':
-                    self.handle_account_info()
-                elif choice == '2':
-                    self.handle_current_price()
-                elif choice == '3':
-                    self.handle_market_order()
-                elif choice == '4':
-                    self.handle_limit_order()
-                elif choice == '5':
-                    self.handle_stop_limit_order()
-                elif choice == '6':
-                    self.handle_open_orders()
-                elif choice == '7':
-                    self.handle_cancel_order()
-                elif choice == '8':
-                    self.handle_order_status()
-                elif choice == '9':
-                    self.show_log_location()
-                else:
-                    print("Invalid choice. Please try again.")
-                
-                input("\nPress Enter to continue...")
-                
-            except KeyboardInterrupt:
-                print("\n\nOperation cancelled by user.")
-                break
-            except Exception as e:
-                print(f"Unexpected error: {e}")
-                self.logger.error(f"CLI error: {e}")
 
 
 def main():
-    """Main function to run the trading bot"""
-    parser = argparse.ArgumentParser(description='Binance Futures Trading Bot')
-    parser.add_argument('--cli', action='store_true', help='Run with CLI interface')
-    parser.add_argument('--api-key', help='Binance API Key')
-    parser.add_argument('--api-secret', help='Binance API Secret')
+    """Main function to run the enhanced trading bot CLI"""
+    parser = argparse.ArgumentParser(description='Enhanced Binance Futures Trading Bot')
+    parser.add_argument('--debug', action='store_true', help='Enable debug logging')
+    parser.add_argument('--requests-only', action='store_true', help='Use requests-only mode')
     
     args = parser.parse_args()
     
-    if args.cli or (not args.api_key or not args.api_secret):
-        # Run CLI interface
-        cli = TradingBotCLI()
+    # Set logging level
+    log_level = logging.DEBUG if args.debug else logging.INFO
+    
+    try:
+        cli = EnhancedTradingBotCLI()
         cli.run()
-    else:
-        # Run programmatically
-        try:
-            bot = BasicBot(args.api_key, args.api_secret, testnet=True)
-            print("Bot initialized successfully!")
-            
-            # Example usage
-            account_info = bot.get_account_info()
-            print(f"Account Balance: {account_info.get('totalWalletBalance', 'N/A')} USDT")
-            
-        except Exception as e:
-            print(f"Error: {e}")
+    except KeyboardInterrupt:
+        print("\n\nBot terminated by user.")
+    except Exception as e:
+        print(f"Fatal error: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

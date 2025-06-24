@@ -1,0 +1,6 @@
+2025-06-24 17:40:09,784 - TradingBot - INFO - Using requests-only mode
+2025-06-24 17:40:09,785 - TradingBot - INFO - Testing API connection...
+2025-06-24 17:40:10,522 - TradingBot - WARNING - Account access limited: API Error -5000: Path /fapi/v1/balance, Method GET is invalid
+2025-06-24 17:40:12,913 - TradingBot - ERROR - Error getting account info: API Error -5000: Path /fapi/v1/balance, Method GET is invalid
+2025-06-24 17:40:34,293 - TradingBot - INFO - Placing market order: BUY 0.001 BTCUSDT
+2025-06-24 17:40:34,443 - TradingBot - INFO - Market order placed: {'orderId': 4688545423, 'symbol': 'BTCUSDT', 'status': 'NEW', 'clientOrderId': 'tAJ0EoP4tjgKPZ786EFjIA', 'price': '0.00', 'avgPrice': '0.00', 'origQty': '0.001', 'executedQty': '0.000', 'cumQty': '0.000', 'cumQuote': '0.00000', 'timeInForce': 'GTC', 'type': 'MARKET', 'reduceOnly': False, 'closePosition': False, 'side': 'BUY', 'positionSide': 'BOTH', 'stopPrice': '0.00', 'workingType': 'CONTRACT_PRICE', 'priceProtect': False, 'origType': 'MARKET', 'priceMatch': 'NONE', 'selfTradePreventionMode': 'EXPIRE_MAKER', 'goodTillDate': 0, 'updateTime': 1750767031548}
